@@ -1,0 +1,19 @@
+# Trading altyapisi (config/trading.yaml + .env)
+
+mode: paper          # paper | live  (veya TRADING_MODE env)
+dry_run: false       # live modda emir gonderme, sadece log
+
+# CLOB
+clob_host: "https://clob.polymarket.com"
+chain_id: 137
+# signature_type: 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE, 3=POLY_1271 (deposit)
+signature_type: 1
+
+# WebSocket
+market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+user_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+ws_ping_seconds: 10
+
+# Paper
+paper_initial_usdc: 30
+default_order_size: 6

@@ -1,0 +1,29 @@
+# Live Strategy v2 — Stock RSI cross (UP token)
+
+market:
+  slug: ""                        # bos = slug_pattern ile en guncel
+  slug_pattern: "btc-updown-5m-*"
+  auto_rollover: true
+  rollover_check_seconds: 15
+
+strategy:
+  rsi_period: 8                   # batch opt: 8
+  use_wilder: true
+  cross_up_level: 45
+  cross_down_level: 55
+  resample_seconds: 1.0
+  size: 6
+  enter_down_when_flat_on_cross_down: true
+  ignore_same_side_signal: true
+  cooldown_seconds: 5
+  min_entry_price: 0.03   # altinda alim yok
+  max_entry_price: 0.97   # ustunde alim yok
+  resolution:
+    block_entries_minutes: 1
+    force_close_minutes: 1
+    hold_force_close_if_mid_gte: 0.70
+    dump_immediately_if_mid_lt: 0.50
+
+gamma_base_url: "https://gamma-api.polymarket.com"
+balance_poll_seconds: 60
+log_every_bar: false

@@ -1,0 +1,56 @@
+---
+description: Yeni trading stratejisi gelistirilirken zorunlu teslimatlar (backtest, opt, viz, resolution)
+alwaysApply: true
+---
+
+# Strategy development checklist
+
+When the user asks to develop or add a **new trading strategy**, deliver **all** of the following unless they explicitly opt out of one item.
+
+## 1. Core module (`src/strategy_<name>/`)
+
+- `config.py` — parameters; include `resolution: ResolutionConfig` from `src/strategy_v2/resolution.py`
+- Signal/indicator logic (e.g. `rsi.py`, `ema.py`)
+- `backtest.py` — `run_backtest()`, `prepare_bars()`, `format_report()`, shared `Side` / legs / round-trips
+- `cli_helpers.py` — `add_resolution_arguments()`, `build_*_config()`, reuse `resolution_from_args`
+
+## 2. Scripts (under `scripts/`)
+
+| Script | Purpose |
+|--------|---------|
+| `backtest_strategy_<name>.py` | Single CSV backtest |
+| `batch_backtest_strategy_<name>.py` | Batch over `data/ws/5m`, `list_*_csvs`, `batch_metrics()` for optimizers |
+| `optimize_strategy_<name>.py` | Grid search on strategy-specific params + `batch_metrics` |
+| `visualize_strategy_<name>.py` | Chart: price, indicator, buy/sell markers, PnL summary; resolution legs styled |
+
+Mirror naming and patterns from `strategy_v2` / `strategy_ema` existing scripts.
+
+## 3. Resolution — last P minutes (mandatory)
+
+Use the **same** rules as live (`config/strategy_v2_live.yaml` / `should_force_close`):
+
+- **Last P dk** (`force_close_minutes` + `block_entries_minutes`): no **new** entries from FLAT; RSI/cross **exit** signals still allowed
+- **Only inside** that window: conditional close open positions
+  - Token `mid` >= `hold_force_close_if_mid_gte` (e.g. 0.90) → **hold** (no force sell)
+  - Token `mid` < `dump_immediately_if_mid_lt` (e.g. 0.20) → **dump** immediately
+  - Between → close in window
+- **Outside** the window: do **not** dump on low mid (common bug)
+- EOF: settlement at mid for held positions; `entries_window_minutes()` for 5m markets
+
+Backtest, batch, optimize, and live engine must all call `should_force_close`, `resolution_phase`, `entries_window_minutes` — not a simplified duplicate.
+
+## 4. CLI
+
+All backtest/batch/optimize/visualize scripts expose:
+
+`--res-block`, `--res-force`, `--res-hold`, `--res-dump` plus strategy-specific flags (`--cross-up`, `--ema-fast`, etc.).
+
+## 5. Live (when requested)
+
+- `src/live_strategy_<name>/` engine + `config/<name>_live.yaml` + `run_live_strategy_<name>.py`
+- Rollover: re-wire market WS handler after `attach_market`
+- Same resolution logic as backtest
+
+## 6. Do not skip
+
+Do not deliver only backtest without optimize/batch/visualize. Do not omit resolution on new strategies.

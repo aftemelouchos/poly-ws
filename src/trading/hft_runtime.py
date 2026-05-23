@@ -1,0 +1,394 @@
+"""HFT runtime: market WS + user WS + trading gateway (dusuk gecikme)."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from src.config import WebSocketConfig
+from src.models import BookState, MarketInfo, OrderBook, TokenLabel
+from src.trading.clob_client import api_creds_from_client, create_clob_client
+from src.trading.config import TradingConfig
+from src.trading.execution import (
+    is_fak_no_match,
+    is_min_notional_error,
+    is_tokens_locked_after_sell,
+    order_size_min_notional,
+)
+from src.trading.factory import create_gateway
+from src.trading.gateway import LiveTradingGateway, TradingGateway
+from src.trading.book_levels import book_ready_for_buy, book_ready_for_sell
+from src.trading.book_sync import order_book_from_rest
+from src.trading.fill_wait import wait_for_token_balance, wait_for_token_cleared
+from src.trading.pricing import (
+    live_buy_taker_price,
+    live_sell_sweep_price,
+    live_sell_taker_price,
+    round_down_shares,
+)
+from src.trading.types import OrderRequest, OrderResult, TradingMode
+from src.ws_market import MarketWebSocket
+from src.ws_user import UserWebSocket
+
+logger = logging.getLogger(__name__)
+
+FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
+TradeHandler = Callable[[dict[str, Any]], Awaitable[None]]
+
+MIN_HELD_SHARES = 0.5
+WS_TRADE_WAIT = 1.2
+FAST_FILL_TIMEOUT = 3.0
+
+
+class HftTradingRuntime:
+    def __init__(self, cfg: TradingConfig, state: BookState | None = None):
+        self.cfg = cfg
+        self.state = state or BookState()
+        self.gateway: TradingGateway = create_gateway(cfg)
+
+        ws_cfg = WebSocketConfig(
+            market_url=cfg.market_ws_url,
+            user_url=cfg.user_ws_url,
+            ping_interval_seconds=cfg.ws_ping_seconds,
+        )
+        self._ws_cfg = ws_cfg
+        self.market_ws: MarketWebSocket | None = None
+        self.user_ws: UserWebSocket | None = None
+        self._clob_client = None
+        self._on_fill: FillHandler | None = None
+        self._on_trade: TradeHandler | None = None
+        self._trade_events: dict[str, asyncio.Event] = {}
+
+    def on_fill(self, handler: FillHandler) -> None:
+        self._on_fill = handler
+
+    def on_trade(self, handler: TradeHandler) -> None:
+        self._on_trade = handler
+
+    def _trade_key(self, token_id: str, side: str) -> str:
+        return f"{token_id}:{side.upper()}"
+
+    def _note_trade(self, token_id: str, side: str) -> None:
+        key = self._trade_key(token_id, side)
+        ev = self._trade_events.get(key)
+        if ev is None:
+            ev = asyncio.Event()
+            self._trade_events[key] = ev
+        ev.set()
+
+    async def wait_trade_ws(
+        self, token_id: str, side: str, timeout: float = WS_TRADE_WAIT
+    ) -> bool:
+        key = self._trade_key(token_id, side)
+        ev = self._trade_events.get(key)
+        if ev is None:
+            ev = asyncio.Event()
+            self._trade_events[key] = ev
+        ev.clear()
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def attach_market(self, market: MarketInfo) -> None:
+        self.state.market = market
+        self.state.tick_size = market.tick_size
+        self.state.books.clear()
+
+        if self.market_ws:
+            await self.market_ws.stop()
+
+        self.market_ws = MarketWebSocket(
+            self._ws_cfg,
+            self.state,
+            on_event=self._on_market_event,
+        )
+        self.market_ws.set_assets(market.yes_token_id, market.no_token_id)
+        await self.market_ws.start()
+
+        if self.cfg.mode == TradingMode.LIVE and isinstance(self.gateway, LiveTradingGateway):
+            await self._start_user_ws(market)
+        logger.info("WS attached | %s", market.slug)
+
+    async def _start_user_ws(self, market: MarketInfo) -> None:
+        if self.user_ws:
+            await self.user_ws.stop()
+
+        client = self.gateway.client
+        self._clob_client = client
+        creds = api_creds_from_client(client)
+
+        self.user_ws = UserWebSocket(
+            self._ws_cfg,
+            self.state,
+            api_key=creds.api_key,
+            secret=creds.api_secret,
+            passphrase=creds.api_passphrase,
+            condition_id=market.condition_id,
+            on_event=self._on_user_event,
+        )
+        await self.user_ws.start()
+
+    async def _on_market_event(self, event_type: str, data: dict) -> None:
+        pass
+
+    async def _on_user_event(self, event_type: str, data: dict) -> None:
+        if event_type == "trade":
+            st = data.get("status", "")
+            if st in ("MATCHED", "CONFIRMED"):
+                asset = str(data.get("asset_id", ""))
+                side = str(data.get("side", "")).upper()
+                if asset and side in ("BUY", "SELL"):
+                    self._note_trade(asset, side)
+        if event_type == "fill" and self._on_fill:
+            await self._on_fill(data)
+        if event_type == "trade" and self._on_trade:
+            await self._on_trade(data)
+
+    async def buy(
+        self,
+        token_id: str,
+        price: float,
+        size: float | None = None,
+        **kwargs,
+    ) -> OrderResult:
+        req = OrderRequest(
+            token_id=token_id,
+            price=price,
+            size=size or self.cfg.default_order_size,
+            tick_size=str(self.state.tick_size),
+            neg_risk=self.state.market.neg_risk if self.state.market else False,
+            **kwargs,
+        )
+        return await self.gateway.buy(req)
+
+    async def sell(
+        self,
+        token_id: str,
+        price: float,
+        size: float | None = None,
+        **kwargs,
+    ) -> OrderResult:
+        req = OrderRequest(
+            token_id=token_id,
+            price=price,
+            size=size or self.cfg.default_order_size,
+            tick_size=str(self.state.tick_size),
+            neg_risk=self.state.market.neg_risk if self.state.market else False,
+            **kwargs,
+        )
+        return await self.gateway.sell(req)
+
+    async def get_balances(self, token_ids: list[str] | None = None):
+        ids = token_ids
+        if ids is None and self.state.market:
+            ids = [self.state.market.yes_token_id, self.state.market.no_token_id]
+        return await self.gateway.get_balances(ids)
+
+    async def wait_for_buy_fill(
+        self,
+        token_id: str,
+        size: float,
+        *,
+        timeout: float = FAST_FILL_TIMEOUT,
+    ) -> tuple[bool, float]:
+        if await self.wait_trade_ws(token_id, "BUY", timeout=WS_TRADE_WAIT):
+            return True, size
+        return await wait_for_token_balance(
+            self.gateway,
+            token_id,
+            size,
+            timeout=timeout,
+            quiet=True,
+        )
+
+    async def wait_for_sell_clear(
+        self,
+        token_id: str,
+        *,
+        timeout: float = FAST_FILL_TIMEOUT,
+    ) -> tuple[bool, float]:
+        if await self.wait_trade_ws(token_id, "SELL", timeout=WS_TRADE_WAIT):
+            return True, 0.0
+        return await wait_for_token_cleared(
+            self.gateway,
+            token_id,
+            timeout=timeout,
+            quiet=True,
+        )
+
+    def _tick(self) -> float:
+        try:
+            return float(self.state.tick_size or 0.01)
+        except (TypeError, ValueError):
+            return 0.01
+
+    def book_ws(self, label: TokenLabel) -> OrderBook:
+        """Sadece WS kitap — REST yok (gecikme yok)."""
+        return self.state.book_for(label)
+
+    async def refresh_book_rest(self, token_id: str, label: TokenLabel) -> OrderBook:
+        if not isinstance(self.gateway, LiveTradingGateway):
+            return self.state.book_for(label)
+        client = self.gateway.client
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, lambda: client.get_order_book(token_id))
+        if not isinstance(raw, dict):
+            return self.state.book_for(label)
+        ob = order_book_from_rest(raw)
+        ob.has_snapshot = True
+        ob.updated_at = time.time()
+        ts = raw.get("tick_size")
+        if ts is not None:
+            try:
+                self.state.tick_size = float(ts)
+            except (TypeError, ValueError):
+                pass
+        self.state.books[token_id] = ob
+        return ob
+
+    async def book_for_trade(
+        self, token_id: str, label: TokenLabel, *, side: str
+    ) -> OrderBook:
+        book = self.book_ws(label)
+        ready = book_ready_for_buy(book) if side == "BUY" else book_ready_for_sell(book)
+        if ready:
+            return book
+        return await self.refresh_book_rest(token_id, label)
+
+    async def held_size(self, token_id: str) -> float:
+        bal = await self.gateway.get_balances([token_id])
+        tb = bal.tokens.get(token_id)
+        return round_down_shares(tb.balance if tb else 0.0)
+
+    async def _sell_confirmed(self, token_id: str, sold_size: float) -> bool:
+        if await self.wait_trade_ws(token_id, "SELL"):
+            return True
+        ok, rem = await wait_for_token_cleared(
+            self.gateway, token_id, timeout=FAST_FILL_TIMEOUT, quiet=True
+        )
+        return ok or rem < MIN_HELD_SHARES
+
+    async def sell_fast(
+        self,
+        token_id: str,
+        label: TokenLabel,
+        size: float | None = None,
+        *,
+        max_attempts: int = 3,
+    ) -> OrderResult:
+        tick = self._tick()
+        remaining = round_down_shares(
+            size if size is not None else await self.held_size(token_id)
+        )
+        if remaining < MIN_HELD_SHARES:
+            return OrderResult(success=True, side="SELL", token_id=token_id, size=0.0)
+
+        last = OrderResult(
+            success=False,
+            side="SELL",
+            token_id=token_id,
+            size=remaining,
+            error="no attempt",
+        )
+
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                remaining = round_down_shares(await self.held_size(token_id))
+                if remaining < MIN_HELD_SHARES:
+                    last.success = True
+                    return last
+
+            book = self.book_ws(label)
+            px, _ = live_sell_taker_price(
+                book, remaining, tick, slippage_ticks=attempt
+            )
+            last = await self.sell(
+                token_id, price=px, size=remaining, order_type="FAK"
+            )
+
+            if last.success:
+                if await self._sell_confirmed(token_id, remaining):
+                    last.success = True
+                    return last
+                continue
+
+            err = last.error or ""
+            if is_tokens_locked_after_sell(err):
+                if await self._sell_confirmed(token_id, remaining):
+                    last.success = True
+                    return last
+                continue
+            if not is_fak_no_match(err):
+                return last
+
+        remaining = round_down_shares(await self.held_size(token_id))
+        if remaining < MIN_HELD_SHARES:
+            last.success = True
+            return last
+
+        book = self.book_ws(label)
+        sweep_px = live_sell_sweep_price(book, tick)
+        last = await self.sell(
+            token_id, price=sweep_px, size=remaining, order_type="FAK"
+        )
+        if last.success or is_tokens_locked_after_sell(last.error or ""):
+            last.success = await self._sell_confirmed(token_id, remaining)
+        return last
+
+    async def buy_fast(
+        self,
+        token_id: str,
+        label: TokenLabel,
+        size: float,
+        *,
+        max_attempts: int = 3,
+    ) -> OrderResult:
+        tick = self._tick()
+        order_size = round_down_shares(size)
+        last = OrderResult(
+            success=False,
+            side="BUY",
+            token_id=token_id,
+            size=order_size,
+            error="no attempt",
+        )
+
+        for attempt in range(max_attempts):
+            book = self.book_ws(label)
+            if not book_ready_for_buy(book):
+                book = await self.refresh_book_rest(token_id, label)
+
+            px, _ = live_buy_taker_price(
+                book, order_size, tick, slippage_ticks=1 + attempt
+            )
+            order_size = order_size_min_notional(px, order_size)
+            last = await self.buy(
+                token_id, price=px, size=order_size, order_type="FAK"
+            )
+            if last.success:
+                return last
+
+            err = last.error or ""
+            if is_fak_no_match(err) or is_min_notional_error(err):
+                if await self.wait_trade_ws(token_id, "BUY", timeout=0.4):
+                    last.success = True
+                    return last
+                got = await self.held_size(token_id)
+                if got >= order_size * 0.85:
+                    last.success = True
+                    return last
+                continue
+            return last
+
+        return last
+
+    async def stop(self) -> None:
+        if self.user_ws:
+            await self.user_ws.stop()
+        if self.market_ws:
+            await self.market_ws.stop()

@@ -1,0 +1,5 @@
+# Backtest / optimize / visualize bagimliliklari (live runtime icin GEREKLI DEGIL).
+# Sadece scripts/ klasoru icin: pip install -r requirements-dev.txt
+-r requirements.txt
+pandas>=2.0
+matplotlib>=3.7

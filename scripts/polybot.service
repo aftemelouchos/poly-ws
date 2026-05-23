@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket Live Strategy v2 (Stock RSI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/poly-ws
+EnvironmentFile=/home/ubuntu/poly-ws/.env
+ExecStart=/home/ubuntu/poly-ws/.venv/bin/python /home/ubuntu/poly-ws/run_live_strategy_v2.py \
+  --rsi-period 8 --cross-up 45 --cross-down 55 -k 6 \
+  --res-force 1 --res-hold 0.7 --res-dump 0.5
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/poly-ws/logs/stdout.log
+StandardError=append:/home/ubuntu/poly-ws/logs/stderr.log
+
+# HFT: yuksek dosya / proses limiti
+LimitNOFILE=65536
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
