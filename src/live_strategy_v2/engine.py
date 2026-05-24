@@ -37,8 +37,9 @@ class StockRsiLiveEngine:
     """
     Canli Strategy v2:
     - Market WS -> UP mid -> RSI cross
-    - cross up: UP al (DOWN varsa sat)
-    - cross down: UP sat, DOWN al
+    - Reverse (ters) mod:
+      - cross up: DOWN al (UP varsa sat)
+      - cross down: DOWN sat, UP al
     - Pozisyon: User WS trade event'leri ile takip (REST = sadece sync + periyodik)
     """
 
@@ -425,12 +426,13 @@ class StockRsiLiveEngine:
         if bar is None:
             return
 
+        # Reverse: cross_up ve cross_down aksiyonlari terslenir.
         if bar.cross_up:
             self.signals_up += 1
-            await self._handle_cross_up(bar)
+            await self._handle_cross_down(bar)
         elif bar.cross_down:
             self.signals_down += 1
-            await self._handle_cross_down(bar)
+            await self._handle_cross_up(bar)
 
     def _cooldown_ok(self, now: datetime) -> bool:
         if self.strat_cfg.cooldown_seconds <= 0 or self._last_trade_at is None:
