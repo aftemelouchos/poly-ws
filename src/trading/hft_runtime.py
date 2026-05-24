@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -21,11 +20,12 @@ from src.trading.execution import (
 from src.trading.factory import create_gateway
 from src.trading.gateway import LiveTradingGateway, TradingGateway
 from src.trading.book_levels import book_ready_for_buy, book_ready_for_sell
-from src.trading.book_sync import order_book_from_rest
 from src.trading.pricing import (
-    live_buy_taker_price,
+    BASE_SLIPPAGE_TICKS,
+    PRICE_CAP,
+    live_buy_market_price,
+    live_sell_market_price,
     live_sell_sweep_price,
-    live_sell_taker_price,
     round_down_shares,
 )
 from src.trading.types import OrderRequest, OrderResult, TradingMode
@@ -162,37 +162,17 @@ class HftTradingRuntime:
             return 0.01
 
     def book_ws(self, label: TokenLabel) -> OrderBook:
-        """Sadece WS kitap — REST yok (gecikme yok)."""
+        """Sadece WS kitap — REST yok."""
         return self.state.book_for(label)
 
-    async def refresh_book_rest(self, token_id: str, label: TokenLabel) -> OrderBook:
-        if not isinstance(self.gateway, LiveTradingGateway):
-            return self.state.book_for(label)
-        client = self.gateway.client
-        loop = asyncio.get_running_loop()
-        raw = await loop.run_in_executor(None, lambda: client.get_order_book(token_id))
-        if not isinstance(raw, dict):
-            return self.state.book_for(label)
-        ob = order_book_from_rest(raw)
-        ob.has_snapshot = True
-        ob.updated_at = time.time()
-        ts = raw.get("tick_size")
-        if ts is not None:
-            try:
-                self.state.tick_size = float(ts)
-            except (TypeError, ValueError):
-                pass
-        self.state.books[token_id] = ob
-        return ob
-
-    async def book_for_trade(
-        self, token_id: str, label: TokenLabel, *, side: str
-    ) -> OrderBook:
-        book = self.book_ws(label)
-        ready = book_ready_for_buy(book) if side == "BUY" else book_ready_for_sell(book)
-        if ready:
-            return book
-        return await self.refresh_book_rest(token_id, label)
+    async def _wait_ws_book(self, label: TokenLabel, *, side: str) -> OrderBook:
+        """WS kitap dolana kadar bekle. REST yok; sleep(0) ile event loop'a birak."""
+        ready_fn = book_ready_for_buy if side == "BUY" else book_ready_for_sell
+        while True:
+            book = self.book_ws(label)
+            if ready_fn(book):
+                return book
+            await asyncio.sleep(0)
 
     def held_size_ws(self, token_id: str) -> float:
         """User WS pozisyonu — anında, REST yok."""
@@ -249,10 +229,9 @@ class HftTradingRuntime:
                     last.success = True
                     return last
 
-            book = self.book_ws(label)
-            px, _ = live_sell_taker_price(
-                book, remaining, tick, slippage_ticks=attempt
-            )
+            book = await self._wait_ws_book(label, side="SELL")
+            slip = BASE_SLIPPAGE_TICKS + attempt * 3
+            px = live_sell_market_price(book, tick, slippage_ticks=slip)
             last = await self.sell(
                 token_id, price=px, size=remaining, order_type="FAK"
             )
@@ -278,7 +257,7 @@ class HftTradingRuntime:
             last.success = True
             return last
 
-        book = self.book_ws(label)
+        book = await self._wait_ws_book(label, side="SELL")
         sweep_px = live_sell_sweep_price(book, tick)
         last = await self.sell(
             token_id, price=sweep_px, size=remaining, order_type="FAK"
@@ -307,13 +286,10 @@ class HftTradingRuntime:
         )
 
         for attempt in range(max_attempts):
-            book = self.book_ws(label)
-            if not book_ready_for_buy(book):
-                book = await self.refresh_book_rest(token_id, label)
+            book = await self._wait_ws_book(label, side="BUY")
 
-            px, _ = live_buy_taker_price(
-                book, order_size, tick, slippage_ticks=1 + attempt
-            )
+            slip = BASE_SLIPPAGE_TICKS + attempt * 3
+            px = live_buy_market_price(book, tick, slippage_ticks=slip)
             order_size = order_size_min_notional(px, order_size)
             last = await self.buy(
                 token_id, price=px, size=order_size, order_type="FAK"
@@ -323,15 +299,25 @@ class HftTradingRuntime:
 
             err = last.error or ""
             if is_fak_no_match(err) or is_min_notional_error(err):
-                # WS apply_fill paralel olarak gelmis mi (parallel partial fill)?
                 got_ws = self.held_size_ws(token_id)
                 if got_ws >= order_size * 0.85:
                     last.success = True
                     return last
-                # Bos kitap — hemen tekrar dene (sleep YOK, wait YOK)
                 continue
             return last
 
+        # Son care: 0.99 tavan — market buy
+        book = await self._wait_ws_book(label, side="BUY")
+        px = PRICE_CAP
+        order_size = order_size_min_notional(px, order_size)
+        last = await self.buy(
+            token_id, price=px, size=order_size, order_type="FAK"
+        )
+        if last.success:
+            return last
+        got_ws = self.held_size_ws(token_id)
+        if got_ws >= order_size * 0.85:
+            last.success = True
         return last
 
     async def stop(self) -> None:

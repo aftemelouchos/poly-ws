@@ -6,6 +6,11 @@ import math
 
 from src.models import OrderBook, PriceLevel
 
+PRICE_CAP = 0.99
+PRICE_FLOOR = 0.01
+# FAK market-style: best ask/bid + buffer tick; retry'de buffer artar
+BASE_SLIPPAGE_TICKS = 3
+
 
 def round_down_shares(value: float, decimals: int = 4) -> float:
     factor = 10**decimals
@@ -56,6 +61,45 @@ def _levels_near_price(
     return [lv for lv in levels if abs(lv.price - price) <= tick * 0.51 + 1e-9]
 
 
+def live_buy_market_price(
+    book: OrderBook,
+    tick: float,
+    *,
+    slippage_ticks: int = BASE_SLIPPAGE_TICKS,
+) -> float:
+    """
+    Market-style FAK BUY: best_ask + buffer, max 0.99.
+    Derinlik yurumez — limit tavan; fill en iyi ask'ten olur.
+    """
+    touch = effective_best_ask(book, tick)
+    slip = max(1, slippage_ticks) * tick
+    if touch is None or touch <= 0:
+        ref = book.mid() or book.last_trade_price or 0.55
+        px = ref + slip
+    else:
+        px = touch + slip
+    return round_up_to_tick(min(PRICE_CAP, px), tick)
+
+
+def live_sell_market_price(
+    book: OrderBook,
+    tick: float,
+    *,
+    slippage_ticks: int = BASE_SLIPPAGE_TICKS,
+) -> float:
+    """
+    Market-style FAK SELL: best_bid - buffer, min 0.01.
+    """
+    touch = effective_best_bid(book, tick)
+    slip = max(1, slippage_ticks) * tick
+    if touch is None or touch <= 0:
+        ref = book.mid() or book.last_trade_price or 0.45
+        px = ref - slip
+    else:
+        px = touch - slip
+    return round_to_tick(max(PRICE_FLOOR, px), tick)
+
+
 def live_buy_taker_price(
     book: OrderBook,
     size: float,
@@ -99,9 +143,7 @@ def live_buy_taker_price(
 
 
 def live_buy_price(book: OrderBook, tick: float, step: int = 0) -> float:
-    px, _ = live_buy_taker_price(book, 1.0, tick)
-    if step > 0:
-        return min(0.99, px + step * tick)
+    px = live_buy_market_price(book, tick, slippage_ticks=BASE_SLIPPAGE_TICKS + step)
     return px
 
 
@@ -145,15 +187,9 @@ def live_sell_taker_price(
 
 
 def live_sell_price(book: OrderBook, tick: float, step: int = 0) -> float:
-    px, _ = live_sell_taker_price(book, 1.0, tick)
-    if step > 0:
-        return max(0.01, px - step * tick)
-    return px
+    return live_sell_market_price(book, tick, slippage_ticks=BASE_SLIPPAGE_TICKS + step)
 
 
 def live_sell_sweep_price(book: OrderBook, tick: float) -> float:
-    if book.bids:
-        low = min(lv.price for lv in book.bids)
-        return round_to_tick(max(0.01, low - 2 * tick), tick)
-    ref = book.best_bid or book.mid() or 0.2
-    return round_to_tick(max(0.01, ref - 3 * tick), tick)
+    """Son care: minimum fiyat — her bid'i kes."""
+    return PRICE_FLOOR
