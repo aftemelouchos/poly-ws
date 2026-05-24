@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -15,6 +17,7 @@ from src.models import BookState, Fill, OpenOrder, Side, TokenLabel
 
 
 EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 class UserWebSocket:
@@ -38,6 +41,10 @@ class UserWebSocket:
         self._ws: ClientConnection | None = None
         self._task: asyncio.Task | None = None
         self._running = False
+        # Polymarket trade id dedup — ayni trade icin MATCHED + CONFIRMED iki kez gelir.
+        # Sadece ilk gorenden apply_fill cagrilir (cift sayim olmaz).
+        self._seen_trades: deque[str] = deque(maxlen=2048)
+        self._seen_set: set[str] = set()
 
     async def start(self) -> None:
         self._running = True
@@ -120,9 +127,27 @@ class UserWebSocket:
         if self.on_event:
             await self.on_event(event_type, data)
 
+    def _mark_seen(self, trade_id: str) -> bool:
+        """Return True if first time seeing this trade id, False if duplicate."""
+        if not trade_id:
+            return True  # id yoksa dedup yapma
+        if trade_id in self._seen_set:
+            return False
+        self._seen_set.add(trade_id)
+        self._seen_trades.append(trade_id)
+        # deque maxlen asilirsa eski id'yi setten de cikar
+        if len(self._seen_set) > self._seen_trades.maxlen:
+            for old in list(self._seen_set - set(self._seen_trades)):
+                self._seen_set.discard(old)
+        return True
+
     async def _on_trade(self, data: dict[str, Any]) -> None:
         status = data.get("status", "")
         if status not in ("MATCHED", "CONFIRMED"):
+            return
+        trade_id = str(data.get("id", "") or data.get("trade_id", "") or "")
+        # MATCHED + CONFIRMED ayni trade icin gelir — fill sadece bir kez apply edilmeli
+        if not self._mark_seen(trade_id):
             return
         asset_id = data.get("asset_id", "")
         label = self.state.token_label(asset_id)
@@ -132,13 +157,22 @@ class UserWebSocket:
         size = float(data.get("size", 0))
         price = float(data.get("price", 0))
         fill = Fill(
-            order_id=data.get("taker_order_id", data.get("id", "")),
+            order_id=data.get("taker_order_id", trade_id),
             token=label,
             side=side,
             price=price,
             size=size,
         )
         self.state.apply_fill(fill)
+        logger.debug(
+            "Fill %s %s %.4f x %.4f id=%s status=%s",
+            label.value,
+            side.value,
+            price,
+            size,
+            trade_id[:12],
+            status,
+        )
         if self.on_event:
             await self.on_event("fill", {"fill": fill})
 

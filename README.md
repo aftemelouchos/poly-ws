@@ -137,7 +137,6 @@ poly-ws/
       execution.py               # FAK hata yorumlama, min notional
       book_levels.py             # WS price_change -> kitap guncelleme
       book_sync.py               # REST kitap snapshot (fallback)
-      fill_wait.py               # fill onayi yedek bakiye poll
       clob_client.py             # CLOB v2 client factory
       factory.py
       config.py

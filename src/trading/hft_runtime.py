@@ -22,7 +22,6 @@ from src.trading.factory import create_gateway
 from src.trading.gateway import LiveTradingGateway, TradingGateway
 from src.trading.book_levels import book_ready_for_buy, book_ready_for_sell
 from src.trading.book_sync import order_book_from_rest
-from src.trading.fill_wait import wait_for_token_balance, wait_for_token_cleared
 from src.trading.pricing import (
     live_buy_taker_price,
     live_sell_sweep_price,
@@ -39,8 +38,9 @@ FillHandler = Callable[[dict[str, Any]], Awaitable[None]]
 TradeHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 MIN_HELD_SHARES = 0.5
-WS_TRADE_WAIT = 1.2
-FAST_FILL_TIMEOUT = 3.0
+# Not: API basari = trade gerceklesti (CLOB orderID dondu). WS event sadece
+# state.positions bookkeeping icin; HFT'de hicbir trade WS event'i icin BEKLENMIYOR.
+# Burada hiç asyncio.wait_for / sleep YOK.
 
 
 class HftTradingRuntime:
@@ -60,39 +60,12 @@ class HftTradingRuntime:
         self._clob_client = None
         self._on_fill: FillHandler | None = None
         self._on_trade: TradeHandler | None = None
-        self._trade_events: dict[str, asyncio.Event] = {}
 
     def on_fill(self, handler: FillHandler) -> None:
         self._on_fill = handler
 
     def on_trade(self, handler: TradeHandler) -> None:
         self._on_trade = handler
-
-    def _trade_key(self, token_id: str, side: str) -> str:
-        return f"{token_id}:{side.upper()}"
-
-    def _note_trade(self, token_id: str, side: str) -> None:
-        key = self._trade_key(token_id, side)
-        ev = self._trade_events.get(key)
-        if ev is None:
-            ev = asyncio.Event()
-            self._trade_events[key] = ev
-        ev.set()
-
-    async def wait_trade_ws(
-        self, token_id: str, side: str, timeout: float = WS_TRADE_WAIT
-    ) -> bool:
-        key = self._trade_key(token_id, side)
-        ev = self._trade_events.get(key)
-        if ev is None:
-            ev = asyncio.Event()
-            self._trade_events[key] = ev
-        ev.clear()
-        try:
-            await asyncio.wait_for(ev.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
 
     async def attach_market(self, market: MarketInfo) -> None:
         self.state.market = market
@@ -137,13 +110,6 @@ class HftTradingRuntime:
         pass
 
     async def _on_user_event(self, event_type: str, data: dict) -> None:
-        if event_type == "trade":
-            st = data.get("status", "")
-            if st in ("MATCHED", "CONFIRMED"):
-                asset = str(data.get("asset_id", ""))
-                side = str(data.get("side", "")).upper()
-                if asset and side in ("BUY", "SELL"):
-                    self._note_trade(asset, side)
         if event_type == "fill" and self._on_fill:
             await self._on_fill(data)
         if event_type == "trade" and self._on_trade:
@@ -189,38 +155,6 @@ class HftTradingRuntime:
             ids = [self.state.market.yes_token_id, self.state.market.no_token_id]
         return await self.gateway.get_balances(ids)
 
-    async def wait_for_buy_fill(
-        self,
-        token_id: str,
-        size: float,
-        *,
-        timeout: float = FAST_FILL_TIMEOUT,
-    ) -> tuple[bool, float]:
-        if await self.wait_trade_ws(token_id, "BUY", timeout=WS_TRADE_WAIT):
-            return True, size
-        return await wait_for_token_balance(
-            self.gateway,
-            token_id,
-            size,
-            timeout=timeout,
-            quiet=True,
-        )
-
-    async def wait_for_sell_clear(
-        self,
-        token_id: str,
-        *,
-        timeout: float = FAST_FILL_TIMEOUT,
-    ) -> tuple[bool, float]:
-        if await self.wait_trade_ws(token_id, "SELL", timeout=WS_TRADE_WAIT):
-            return True, 0.0
-        return await wait_for_token_cleared(
-            self.gateway,
-            token_id,
-            timeout=timeout,
-            quiet=True,
-        )
-
     def _tick(self) -> float:
         try:
             return float(self.state.tick_size or 0.01)
@@ -260,18 +194,26 @@ class HftTradingRuntime:
             return book
         return await self.refresh_book_rest(token_id, label)
 
-    async def held_size(self, token_id: str) -> float:
+    def held_size_ws(self, token_id: str) -> float:
+        """User WS pozisyonu — anında, REST yok."""
+        label = self.state.token_label(token_id)
+        if label:
+            return round_down_shares(self.state.positions.get(label, 0.0))
+        return 0.0
+
+    async def held_size(self, token_id: str, *, force_rest: bool = False) -> float:
+        """WS pozisyonu yeterse onu kullan; degilse REST."""
+        if not force_rest:
+            v = self.held_size_ws(token_id)
+            if v >= MIN_HELD_SHARES:
+                return v
         bal = await self.gateway.get_balances([token_id])
         tb = bal.tokens.get(token_id)
         return round_down_shares(tb.balance if tb else 0.0)
 
-    async def _sell_confirmed(self, token_id: str, sold_size: float) -> bool:
-        if await self.wait_trade_ws(token_id, "SELL"):
-            return True
-        ok, rem = await wait_for_token_cleared(
-            self.gateway, token_id, timeout=FAST_FILL_TIMEOUT, quiet=True
-        )
-        return ok or rem < MIN_HELD_SHARES
+    def _sell_confirmed_local(self, token_id: str) -> bool:
+        """WS apply_fill anlik state.positions'i azalttiysa onayli."""
+        return self.held_size_ws(token_id) < MIN_HELD_SHARES
 
     async def sell_fast(
         self,
@@ -279,12 +221,15 @@ class HftTradingRuntime:
         label: TokenLabel,
         size: float | None = None,
         *,
-        max_attempts: int = 3,
+        max_attempts: int = 4,
     ) -> OrderResult:
+        """FAK sat — agresif retry, REST yerine WS pozisyonuna guvenir."""
         tick = self._tick()
-        remaining = round_down_shares(
-            size if size is not None else await self.held_size(token_id)
-        )
+        # Hizli yol: size verilmediyse WS pozisyonundan oku
+        if size is None:
+            remaining = self.held_size_ws(token_id)
+        else:
+            remaining = round_down_shares(size)
         if remaining < MIN_HELD_SHARES:
             return OrderResult(success=True, side="SELL", token_id=token_id, size=0.0)
 
@@ -298,7 +243,8 @@ class HftTradingRuntime:
 
         for attempt in range(max_attempts):
             if attempt > 0:
-                remaining = round_down_shares(await self.held_size(token_id))
+                # WS pozisyonu hemen guncel; REST'e dusmek gereksiz
+                remaining = self.held_size_ws(token_id)
                 if remaining < MIN_HELD_SHARES:
                     last.success = True
                     return last
@@ -311,22 +257,23 @@ class HftTradingRuntime:
                 token_id, price=px, size=remaining, order_type="FAK"
             )
 
+            # API basari = FAK match oldu (kismi olabilir). WS event beklemiyoruz.
             if last.success:
-                if await self._sell_confirmed(token_id, remaining):
-                    last.success = True
-                    return last
-                continue
+                return last
 
             err = last.error or ""
             if is_tokens_locked_after_sell(err):
-                if await self._sell_confirmed(token_id, remaining):
+                # WS apply_fill yetisti mi?
+                if self._sell_confirmed_local(token_id):
                     last.success = True
                     return last
                 continue
             if not is_fak_no_match(err):
                 return last
+            # FAK no_match: anlik kitap bos, hemen tekrar dene (sleep YOK)
 
-        remaining = round_down_shares(await self.held_size(token_id))
+        # Son care: ladder sweep
+        remaining = self.held_size_ws(token_id)
         if remaining < MIN_HELD_SHARES:
             last.success = True
             return last
@@ -337,7 +284,7 @@ class HftTradingRuntime:
             token_id, price=sweep_px, size=remaining, order_type="FAK"
         )
         if last.success or is_tokens_locked_after_sell(last.error or ""):
-            last.success = await self._sell_confirmed(token_id, remaining)
+            last.success = True
         return last
 
     async def buy_fast(
@@ -346,8 +293,9 @@ class HftTradingRuntime:
         label: TokenLabel,
         size: float,
         *,
-        max_attempts: int = 3,
+        max_attempts: int = 4,
     ) -> OrderResult:
+        """FAK al — agresif retry, REST yerine WS pozisyonuna guvenir."""
         tick = self._tick()
         order_size = round_down_shares(size)
         last = OrderResult(
@@ -375,13 +323,12 @@ class HftTradingRuntime:
 
             err = last.error or ""
             if is_fak_no_match(err) or is_min_notional_error(err):
-                if await self.wait_trade_ws(token_id, "BUY", timeout=0.4):
+                # WS apply_fill paralel olarak gelmis mi (parallel partial fill)?
+                got_ws = self.held_size_ws(token_id)
+                if got_ws >= order_size * 0.85:
                     last.success = True
                     return last
-                got = await self.held_size(token_id)
-                if got >= order_size * 0.85:
-                    last.success = True
-                    return last
+                # Bos kitap — hemen tekrar dene (sleep YOK, wait YOK)
                 continue
             return last
 

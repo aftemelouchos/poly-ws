@@ -27,8 +27,10 @@ from src.trading.types import TradingMode
 
 logger = logging.getLogger(__name__)
 
-LIVE_FILL_TIMEOUT = 3.0
 MIN_POSITION_SHARES = 0.5
+# Orphan retry throttle — ayni token icin SELL spam'ini engelle (CLOB rate limit).
+# Bu timeout DEGIL, sadece "iki retry arasi en az X saniye" anlamina gelir.
+ORPHAN_RETRY_INTERVAL = 0.4
 
 
 class StockRsiLiveEngine:
@@ -69,6 +71,9 @@ class StockRsiLiveEngine:
         self._balance_task: asyncio.Task | None = None
         self._resolution_phase: str = ""
         self._market_end_dt: datetime | None = None
+        # Orphan reconcile: SELL fail olduysa hangi token agresif retry'a alindi
+        self._needs_flatten: set[TokenLabel] = set()
+        self._last_orphan_retry: dict[TokenLabel, float] = {}
         self.signals_up = 0
         self.signals_down = 0
         self.trades_executed = 0
@@ -155,9 +160,10 @@ class StockRsiLiveEngine:
     def _no_pos(self) -> float:
         return self.state.positions.get(TokenLabel.NO, 0.0)
 
-    async def _held_size(self, token_id: str) -> float:
+    async def _held_size(self, token_id: str, *, force_rest: bool = False) -> float:
+        """WS pozisyonu yeterse onu kullan; sadece force_rest veya WS bos ise REST."""
         label = self.state.token_label(token_id)
-        if label:
+        if not force_rest and label:
             local = self.state.positions.get(label, 0.0)
             if local >= MIN_POSITION_SHARES:
                 return local
@@ -209,34 +215,49 @@ class StockRsiLiveEngine:
             if token == TokenLabel.YES
             else self._market.no_token_id
         )
-        size = await self._held_size(token_id)
+        size = self.state.positions.get(token, 0.0)
         if size < MIN_POSITION_SHARES:
+            self._needs_flatten.discard(token)
             return True
         t0 = time.monotonic_ns()
         res = await self.rt.sell_fast(token_id, token, size)
         elapsed_ms = (time.monotonic_ns() - t0) / 1_000_000
 
-        held = self.state.positions.get(token, size)
-        if not res.success and held >= MIN_POSITION_SHARES:
-            held = await self._held_size(token_id)
-
-        ok = res.success or held < MIN_POSITION_SHARES
-        if not ok:
+        # API basari = trade gerceklesti. State.positions WS ile arka planda guncellenir.
+        if not res.success:
+            self._needs_flatten.add(token)
             logger.warning(
-                "[%s] SELL fail %.0fms: %s",
+                "[%s] SELL fail %.0fms (queue retry): %s",
                 label,
                 elapsed_ms,
                 (res.error or "")[:80],
             )
             return False
 
-        if held < MIN_POSITION_SHARES:
-            if token == TokenLabel.YES and self._position == Side.UP:
-                self._position = Side.FLAT
-            elif token == TokenLabel.NO and self._position == Side.DOWN:
-                self._position = Side.FLAT
+        self._needs_flatten.discard(token)
+        if token == TokenLabel.YES and self._position == Side.UP:
+            self._position = Side.FLAT
+        elif token == TokenLabel.NO and self._position == Side.DOWN:
+            self._position = Side.FLAT
         logger.info("[%s] SELL x %.1f | %.0fms", label, size, elapsed_ms)
         return True
+
+    async def _retry_orphans(self) -> None:
+        """Her market WS tick'inde: pending orphan'lari hemen yeniden sat."""
+        if not self._needs_flatten or not self._is_live():
+            return
+        now = time.monotonic()
+        bar = self._current_bar_snapshot()
+        for token in list(self._needs_flatten):
+            current = self.state.positions.get(token, 0.0)
+            if current < MIN_POSITION_SHARES:
+                self._needs_flatten.discard(token)
+                continue
+            last_t = self._last_orphan_retry.get(token, 0.0)
+            if now - last_t < ORPHAN_RETRY_INTERVAL:
+                continue
+            self._last_orphan_retry[token] = now
+            await self._flatten_token(token, bar, f"RETRY_{token.value}")
 
     async def _prepare_flip_to(self, target: Side, bar: BarSnapshot) -> bool:
         """UP/DOWN flip: karsi taraf orphan + mevcut pozisyonu kapat."""
@@ -305,6 +326,8 @@ class StockRsiLiveEngine:
             return
         async with self._trade_lock:
             await self._check_resolution_risk()
+            # Pozisyon ile bakiye uyusmuyorsa RSI sinyali beklemeden hemen sat
+            await self._retry_orphans()
             await self._evaluate_rsi()
 
     def _position_mid(self) -> float | None:
@@ -492,23 +515,18 @@ class StockRsiLiveEngine:
 
         t0 = time.monotonic_ns()
         res = await self.rt.buy_fast(token_id, token, self.strat_cfg.size)
-        # User WS fill onayini bekle (lightweight, REST yok)
-        if res.success:
-            await self.rt.wait_trade_ws(token_id, "BUY", timeout=0.5)
         elapsed_ms = (time.monotonic_ns() - t0) / 1_000_000
 
-        got = self.state.positions.get(token, 0.0)
-        if not res.success and got < MIN_POSITION_SHARES:
-            got = await self._held_size(token_id)
-
-        if got >= MIN_POSITION_SHARES:
+        # API success = CLOB orderID dondu -> FAK match oldu. WS event beklemiyoruz.
+        # state.positions WS apply_fill ile arka planda guncellenir (dedup'lu).
+        if res.success:
             self._position = new_pos
             self._last_trade_at = bar.time
             self.trades_executed += 1
             logger.info(
                 "[%s] BUY x %.1f | pos=%s | rsi=%.0f | %.0fms",
                 label,
-                got,
+                res.size or self.strat_cfg.size,
                 new_pos.value,
                 bar.rsi,
                 elapsed_ms,
